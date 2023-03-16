@@ -327,7 +327,7 @@ func (fc *FileCache) RunGC() {
 			select {
 			case <-ticker.C:
 				if err := fc.cleanCachedFiles(); err != nil {
-					logrus.WithError(err).Error("Failed to clean cached files")
+					logrus.WithError(err).Warn("Failed to clean cached files")
 				}
 			case <-fc.quit:
 				return
