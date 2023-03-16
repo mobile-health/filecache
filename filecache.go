@@ -250,15 +250,18 @@ func (fc *FileCache) cleanCachedFileByTTL() error {
 		return nil
 	}
 
+	count := 0
 	for _, file := range files {
 		ttl := time.Since(file.ModTime())
 		if ttl > fc.MaxTTL {
 			if err := fc.Delete(file.Name()); err != nil {
 				return err
 			}
-			fc.Logger.Debugf("cleaned cache file %s", file.Name())
+			count++
+			fc.Logger.WithField("strategy", "TTL").Debugf("Cleaned cache file %s", file.Name())
 		}
 	}
+	fc.Logger.WithField("strategy", "TTL").Infof("Cleaned %v files", count)
 	return nil
 }
 
@@ -294,15 +297,15 @@ func (fc *FileCache) cleanCachedFileByLRU() error {
 			if err := fc.Delete(file.Name()); err != nil {
 				return err
 			} else {
-				fc.Logger.Debugf("cleaned cache file %s", file.Name())
+				fc.Logger.WithField("strategy", "LRU").Debugf("Cleaned cached file %s", file.Name())
 
 				cleanedSize += file.Size()
 				if cleanedSize >= resize {
-					fc.Logger.Infof("Cleaned %v(MB) cached files", byte2MB(resize))
 					break
 				}
 			}
 		}
+		fc.Logger.WithField("strategy", "LRU").Infof("Cleaned %v(MB) cached files", byte2MB(cleanedSize))
 	}
 	return nil
 }
