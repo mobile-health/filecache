@@ -65,6 +65,43 @@ func TestWrite(t *testing.T) {
 	}
 }
 
+func getModTime(path string) (time.Time, error) {
+	fs, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return fs.ModTime(), nil
+}
+
+func TestRead(t *testing.T) {
+	fc := New(Config{TempDir: "tmp"}, nil)
+	defer fc.Empty()
+
+	if err := fc.Write("key", sampleReader("ABC")); err != nil {
+		t.Fatal(err)
+	}
+
+	if r, err := fc.Read("key"); err != nil {
+		t.Fatal(err)
+	} else {
+		var buf bytes.Buffer
+		io.Copy(&buf, r)
+		if buf.String() != "ABC" {
+			t.Fatal("file not matched")
+		}
+	}
+	mt1, err := getModTime(fc.absFilePath("key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Second)
+	fc.Read("key")
+	mt2, _ := getModTime(fc.absFilePath("key"))
+	if mt2.Unix() <= mt1.Unix() {
+		t.Fatal("mod time must be changed")
+	}
+}
+
 func TestFiles(t *testing.T) {
 	fc := New(Config{TempDir: "tmp"}, nil)
 	defer fc.Empty()
@@ -205,8 +242,8 @@ func TestCleanCachedFileByLRU(t *testing.T) {
 	if err := fc.Write("key3", sampleReader(data)); err != nil {
 		t.Fatal(err)
 	}
-	fc.Touch("key1", time.Now().Add(-time.Minute))
-	fc.Touch("key3", time.Now().Add(-time.Minute))
+	fc.touch("key1", time.Now().Add(-time.Minute))
+	fc.touch("key3", time.Now().Add(-time.Minute))
 
 	if err := fc.cleanCachedFileByLRU(); err != nil {
 		t.Fatal(err)
