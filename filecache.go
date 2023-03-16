@@ -15,7 +15,7 @@ import (
 
 const (
 	defaultMaxSize         = 1024 * 1024 * 1024 // 1GB
-	defaultMaxTTL          = 4 * 60 * 60        // 4 hours
+	defaultMaxTTL          = 4 * time.Hour      // 4 hours
 	defaultBaseDir         = "filecache"
 	defaultCleanupInterval = 5 * time.Minute
 	defaultLockKey         = "lock_filecache"
