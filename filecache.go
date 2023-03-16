@@ -143,7 +143,7 @@ func (f *FileCache) Has(key string) bool {
 // Write writes an file to disk
 func (f *FileCache) Write(key string, r io.Reader) error {
 	if f.lockFactory != nil {
-		lock, err := f.lockFactory.Lock(defaultLockKey)
+		lock, err := f.lockFactory.Lock(defaultLockKey + key)
 		if err != nil {
 			return err
 		}
