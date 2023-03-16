@@ -2,6 +2,7 @@ package filecache
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -17,7 +18,7 @@ const (
 	defaultMaxTTL          = 4 * 60 * 60        // 4 hours
 	defaultBaseDir         = "filecache"
 	defaultCleanupInterval = 5 * time.Minute
-	defaultLockKey         = "FILECACHE"
+	defaultLockKey         = "lock_filecache"
 	defaultDirFileMode     = os.FileMode(0777)
 )
 
@@ -101,6 +102,10 @@ func checkFileExist(asbFilePath string) error {
 	return nil
 }
 
+func keylock(key string) string {
+	return fmt.Sprintf("%s_%s", defaultLockKey, key)
+}
+
 func (f *FileCache) absFilePath(key string) string {
 	return filepath.Join(f.BaseDir, key)
 }
@@ -115,14 +120,6 @@ func (f *FileCache) hasFile(key string) (string, error) {
 
 // Read returns an IO stream of file reader
 func (f *FileCache) Read(key string) (io.ReadCloser, error) {
-	if f.lockFactory != nil {
-		lock, err := f.lockFactory.Lock(defaultLockKey)
-		if err != nil {
-			return nil, err
-		}
-		defer lock.Unlock()
-	}
-
 	absFilePath, err := f.hasFile(key)
 	if err != nil {
 		return nil, err
@@ -143,7 +140,7 @@ func (f *FileCache) Has(key string) bool {
 // Write writes an file to disk
 func (f *FileCache) Write(key string, r io.Reader) error {
 	if f.lockFactory != nil {
-		lock, err := f.lockFactory.Lock(defaultLockKey + key)
+		lock, err := f.lockFactory.Lock(keylock(key))
 		if err != nil {
 			return err
 		}
@@ -176,7 +173,7 @@ func (f *FileCache) Write(key string, r io.Reader) error {
 
 func (f *FileCache) Delete(key string) error {
 	if f.lockFactory != nil {
-		lock, err := f.lockFactory.Lock(defaultLockKey)
+		lock, err := f.lockFactory.Lock(keylock(key))
 		if err != nil {
 			return err
 		}
