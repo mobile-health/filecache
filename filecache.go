@@ -32,6 +32,7 @@ type Config struct {
 	MaxSize         int64
 	MaxTTL          time.Duration
 	CleanupInterval time.Duration
+	LogLevel        logrus.Level
 }
 
 type ILock interface {
@@ -46,6 +47,7 @@ type FileCache struct {
 	Config
 	lockFactory ILockFatory
 	quit        chan bool
+	Logger      *logrus.Logger
 }
 
 func ensureDir(dir string) (string, error) {
@@ -87,6 +89,14 @@ func New(config Config, lockFactory ILockFatory) *FileCache {
 	}
 	if fc.CleanupInterval == 0 {
 		fc.CleanupInterval = defaultCleanupInterval
+	}
+	fc.Logger = &logrus.Logger{
+		Out:          os.Stderr,
+		Formatter:    new(logrus.TextFormatter),
+		Hooks:        make(logrus.LevelHooks),
+		Level:        fc.LogLevel,
+		ExitFunc:     os.Exit,
+		ReportCaller: false,
 	}
 	return fc
 }
@@ -246,6 +256,7 @@ func (fc *FileCache) cleanCachedFileByTTL() error {
 			if err := fc.Delete(file.Name()); err != nil {
 				return err
 			}
+			fc.Logger.Debugf("cleaned cache file %s", file.Name())
 		}
 	}
 	return nil
@@ -283,9 +294,11 @@ func (fc *FileCache) cleanCachedFileByLRU() error {
 			if err := fc.Delete(file.Name()); err != nil {
 				return err
 			} else {
+				fc.Logger.Debugf("cleaned cache file %s", file.Name())
+
 				cleanedSize += file.Size()
 				if cleanedSize >= resize {
-					logrus.Infof("Cleaned %v(MB) cached files", byte2MB(resize))
+					fc.Logger.Infof("Cleaned %v(MB) cached files", byte2MB(resize))
 					break
 				}
 			}
@@ -295,7 +308,7 @@ func (fc *FileCache) cleanCachedFileByLRU() error {
 }
 
 func (fc *FileCache) cleanCachedFiles() error {
-	logrus.Info("Start clearning cached files")
+	fc.Logger.Info("Start clearning cached files")
 
 	if fc.lockFactory != nil {
 		lock, err := fc.lockFactory.Lock(defaultLockKey)
@@ -324,7 +337,7 @@ func (fc *FileCache) RunGC() {
 			select {
 			case <-ticker.C:
 				if err := fc.cleanCachedFiles(); err != nil {
-					logrus.WithError(err).Warn("Failed to clean cached files")
+					fc.Logger.WithError(err).Warn("Failed to clean cached files")
 				}
 			case <-fc.quit:
 				return
