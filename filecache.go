@@ -135,6 +135,10 @@ func (f *FileCache) Read(key string) (io.ReadCloser, error) {
 		return nil, err
 	}
 
+	if err := f.touch(key, time.Now()); err != nil {
+		return nil, err
+	}
+
 	file, err := os.Open(absFilePath)
 	if err != nil {
 		return nil, err
@@ -215,7 +219,7 @@ func (f *FileCache) Empty() error {
 	return nil
 }
 
-func (fc FileCache) Touch(key string, ts time.Time) error {
+func (fc FileCache) touch(key string, ts time.Time) error {
 	if ts.IsZero() {
 		ts = time.Now()
 	}
