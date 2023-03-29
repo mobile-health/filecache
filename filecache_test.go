@@ -182,6 +182,14 @@ func (fac *LockFactory) Lock(key string) (ILock, error) {
 	}, nil
 }
 
+func (fac *LockFactory) Has(key string) bool {
+	fac.mutex.Lock()
+	defer fac.mutex.Unlock()
+
+	_, ok := fac.locks[key]
+	return ok
+}
+
 func TestLocker(t *testing.T) {
 	lockFactory := &LockFactory{locks: map[string]bool{}, mutex: &sync.Mutex{}}
 

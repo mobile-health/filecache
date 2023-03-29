@@ -41,6 +41,7 @@ type ILock interface {
 
 type ILockFatory interface {
 	Lock(key string) (ILock, error)
+	Has(key string) bool
 }
 
 type FileCache struct {
@@ -130,6 +131,12 @@ func (f *FileCache) hasFile(key string) (string, error) {
 
 // Read returns an IO stream of file reader
 func (f *FileCache) Read(key string) (io.ReadCloser, error) {
+	if f.lockFactory != nil {
+		if f.lockFactory.Has(keylock(key)) {
+			return nil, errors.New("has locked")
+		}
+	}
+
 	absFilePath, err := f.hasFile(key)
 	if err != nil {
 		return nil, err
