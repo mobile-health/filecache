@@ -1,6 +1,7 @@
 package filecache
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -36,12 +37,12 @@ type Config struct {
 }
 
 type ILock interface {
-	Unlock()
+	Unlock(ctx context.Context)
 }
 
 type ILockFatory interface {
-	Lock(key string) (ILock, error)
-	Has(key string) bool
+	Lock(ctx context.Context, key string) (ILock, error)
+	Has(ctx context.Context, key string) bool
 }
 
 type FileCache struct {
@@ -130,9 +131,9 @@ func (f *FileCache) hasFile(key string) (string, error) {
 }
 
 // Read returns an IO stream of file reader
-func (f *FileCache) Read(key string) (io.ReadCloser, error) {
+func (f *FileCache) Read(ctx context.Context, key string) (io.ReadCloser, error) {
 	if f.lockFactory != nil {
-		if f.lockFactory.Has(keylock(key)) {
+		if f.lockFactory.Has(ctx, keylock(key)) {
 			return nil, errors.New("has locked")
 		}
 	}
@@ -159,13 +160,13 @@ func (f *FileCache) Has(key string) bool {
 }
 
 // Write writes an file to disk
-func (f *FileCache) Write(key string, r io.Reader) error {
+func (f *FileCache) Write(ctx context.Context, key string, r io.Reader) error {
 	if f.lockFactory != nil {
-		lock, err := f.lockFactory.Lock(keylock(key))
+		lock, err := f.lockFactory.Lock(ctx, keylock(key))
 		if err != nil {
 			return err
 		}
-		defer lock.Unlock()
+		defer lock.Unlock(ctx)
 	}
 
 	absFilePath, err := f.hasFile(key)
@@ -192,13 +193,13 @@ func (f *FileCache) Write(key string, r io.Reader) error {
 	return nil
 }
 
-func (f *FileCache) Delete(key string) error {
+func (f *FileCache) Delete(ctx context.Context, key string) error {
 	if f.lockFactory != nil {
-		lock, err := f.lockFactory.Lock(keylock(key))
+		lock, err := f.lockFactory.Lock(ctx, keylock(key))
 		if err != nil {
 			return err
 		}
-		defer lock.Unlock()
+		defer lock.Unlock(ctx)
 	}
 
 	absFilePath, err := f.hasFile(key)
@@ -208,13 +209,13 @@ func (f *FileCache) Delete(key string) error {
 	return os.Remove(absFilePath)
 }
 
-func (f *FileCache) Empty() error {
+func (f *FileCache) Empty(ctx context.Context) error {
 	if f.lockFactory != nil {
-		lock, err := f.lockFactory.Lock(defaultLockKey)
+		lock, err := f.lockFactory.Lock(ctx, defaultLockKey)
 		if err != nil {
 			return err
 		}
-		defer lock.Unlock()
+		defer lock.Unlock(ctx)
 	}
 
 	if err := os.RemoveAll(f.TempDir); err != nil {
@@ -255,7 +256,7 @@ func (fc *FileCache) Files() ([]fs.FileInfo, error) {
 	return list, nil
 }
 
-func (fc *FileCache) cleanCachedFileByTTL() error {
+func (fc *FileCache) cleanCachedFileByTTL(ctx context.Context) error {
 	files, err := fc.Files()
 	if err != nil {
 		return nil
@@ -265,7 +266,7 @@ func (fc *FileCache) cleanCachedFileByTTL() error {
 	for _, file := range files {
 		ttl := time.Since(file.ModTime())
 		if ttl > fc.MaxTTL {
-			if err := fc.Delete(file.Name()); err != nil {
+			if err := fc.Delete(ctx, file.Name()); err != nil {
 				return err
 			}
 			count++
@@ -291,7 +292,7 @@ func (fc *FileCache) Size() (int64, error) {
 
 }
 
-func (fc *FileCache) cleanCachedFileByLRU() error {
+func (fc *FileCache) cleanCachedFileByLRU(ctx context.Context) error {
 	curSize, err := fc.Size()
 	if err != nil {
 		return err
@@ -305,7 +306,7 @@ func (fc *FileCache) cleanCachedFileByLRU() error {
 
 		cleanedSize := int64(0)
 		for _, file := range files {
-			if err := fc.Delete(file.Name()); err != nil {
+			if err := fc.Delete(ctx, file.Name()); err != nil {
 				return err
 			} else {
 				fc.Logger.WithField("strategy", "LRU").Debugf("Cleaned cached file %s", file.Name())
@@ -321,22 +322,22 @@ func (fc *FileCache) cleanCachedFileByLRU() error {
 	return nil
 }
 
-func (fc *FileCache) cleanCachedFiles() error {
+func (fc *FileCache) cleanCachedFiles(ctx context.Context) error {
 	fc.Logger.Info("Start clearning cached files")
 
 	if fc.lockFactory != nil {
-		lock, err := fc.lockFactory.Lock(defaultLockKey)
+		lock, err := fc.lockFactory.Lock(ctx, defaultLockKey)
 		if err != nil {
 			return err
 		}
-		defer lock.Unlock()
+		defer lock.Unlock(ctx)
 	}
 
-	if err := fc.cleanCachedFileByTTL(); err != nil {
+	if err := fc.cleanCachedFileByTTL(ctx); err != nil {
 		return err
 	}
 
-	if err := fc.cleanCachedFileByLRU(); err != nil {
+	if err := fc.cleanCachedFileByLRU(ctx); err != nil {
 		return err
 	}
 	return nil
@@ -350,9 +351,11 @@ func (fc *FileCache) RunGC() {
 			<-ticker.C
 			select {
 			case <-ticker.C:
-				if err := fc.cleanCachedFiles(); err != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+				if err := fc.cleanCachedFiles(ctx); err != nil {
 					fc.Logger.WithError(err).Warn("Failed to clean cached files")
 				}
+				cancel()
 			case <-fc.quit:
 				return
 			}

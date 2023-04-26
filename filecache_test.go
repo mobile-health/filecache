@@ -2,6 +2,7 @@ package filecache
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -23,14 +24,16 @@ func existDir(dir string) bool {
 }
 
 func TestWriteReadEmpty(t *testing.T) {
-	fc := New(Config{TempDir: "tmp"}, nil)
-	defer fc.Empty()
+	ctx := context.Background()
 
-	if err := fc.Write("key", sampleReader("ABC")); err != nil {
+	fc := New(Config{TempDir: "tmp"}, nil)
+	defer fc.Empty(ctx)
+
+	if err := fc.Write(ctx, "key", sampleReader("ABC")); err != nil {
 		t.Fatal(err)
 	}
 
-	r, err := fc.Read("key")
+	r, err := fc.Read(ctx, "key")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +47,7 @@ func TestWriteReadEmpty(t *testing.T) {
 		t.Fatal("data not match")
 	}
 
-	if err := fc.Empty(); err != nil {
+	if err := fc.Empty(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if existDir(fc.BaseDir) || existDir(fc.TempDir) {
@@ -53,14 +56,16 @@ func TestWriteReadEmpty(t *testing.T) {
 }
 
 func TestWrite(t *testing.T) {
-	fc := New(Config{TempDir: "tmp"}, nil)
-	defer fc.Empty()
+	ctx := context.Background()
 
-	if err := fc.Write("key", sampleReader("ABC")); err != nil {
+	fc := New(Config{TempDir: "tmp"}, nil)
+	defer fc.Empty(ctx)
+
+	if err := fc.Write(ctx, "key", sampleReader("ABC")); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := fc.Write("key", sampleReader("ABC")); err == nil {
+	if err := fc.Write(ctx, "key", sampleReader("ABC")); err == nil {
 		t.Fatal("must duplicate error")
 	}
 }
@@ -74,14 +79,16 @@ func getModTime(path string) (time.Time, error) {
 }
 
 func TestRead(t *testing.T) {
-	fc := New(Config{TempDir: "tmp"}, nil)
-	defer fc.Empty()
+	ctx := context.Background()
 
-	if err := fc.Write("key", sampleReader("ABC")); err != nil {
+	fc := New(Config{TempDir: "tmp"}, nil)
+	defer fc.Empty(ctx)
+
+	if err := fc.Write(ctx, "key", sampleReader("ABC")); err != nil {
 		t.Fatal(err)
 	}
 
-	if r, err := fc.Read("key"); err != nil {
+	if r, err := fc.Read(ctx, "key"); err != nil {
 		t.Fatal(err)
 	} else {
 		var buf bytes.Buffer
@@ -95,7 +102,7 @@ func TestRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(time.Second)
-	fc.Read("key")
+	fc.Read(ctx, "key")
 	mt2, _ := getModTime(fc.absFilePath("key"))
 	if mt2.Unix() <= mt1.Unix() {
 		t.Fatal("mod time must be changed")
@@ -103,20 +110,22 @@ func TestRead(t *testing.T) {
 }
 
 func TestFiles(t *testing.T) {
+	ctx := context.Background()
+
 	fc := New(Config{TempDir: "tmp"}, nil)
-	defer fc.Empty()
+	defer fc.Empty(ctx)
 
-	if err := fc.Write("key1", sampleReader("ABC2")); err != nil {
+	if err := fc.Write(ctx, "key1", sampleReader("ABC2")); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(time.Second * 1)
 
-	if err := fc.Write("key2", sampleReader("ABC3")); err != nil {
+	if err := fc.Write(ctx, "key2", sampleReader("ABC3")); err != nil {
 		t.Fatal(err)
 	}
 
 	time.Sleep(time.Second * 1)
-	if err := fc.Write("akey", sampleReader("ABC3")); err != nil {
+	if err := fc.Write(ctx, "akey", sampleReader("ABC3")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -138,14 +147,16 @@ func TestFiles(t *testing.T) {
 }
 
 func TestDelete(t *testing.T) {
-	fc := New(Config{TempDir: "tmp"}, nil)
-	defer fc.Empty()
+	ctx := context.Background()
 
-	fc.Write("key1", sampleReader("ABC1"))
-	if err := fc.Delete("key1"); err != nil {
+	fc := New(Config{TempDir: "tmp"}, nil)
+	defer fc.Empty(ctx)
+
+	fc.Write(ctx, "key1", sampleReader("ABC1"))
+	if err := fc.Delete(ctx, "key1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fc.Read("key1"); err == nil {
+	if _, err := fc.Read(ctx, "key1"); err == nil {
 		t.Fatal("key1 must be deleted")
 	}
 }
@@ -156,7 +167,7 @@ type Lock struct {
 	mutex *sync.Mutex
 }
 
-func (l *Lock) Unlock() {
+func (l *Lock) Unlock(ctx context.Context) {
 	l.mutex.Lock()
 	defer l.mutex.Unlock()
 	delete(l.locks, l.key)
@@ -167,7 +178,7 @@ type LockFactory struct {
 	mutex *sync.Mutex
 }
 
-func (fac *LockFactory) Lock(key string) (ILock, error) {
+func (fac *LockFactory) Lock(ctx context.Context, key string) (ILock, error) {
 	fac.mutex.Lock()
 	defer fac.mutex.Unlock()
 
@@ -182,7 +193,7 @@ func (fac *LockFactory) Lock(key string) (ILock, error) {
 	}, nil
 }
 
-func (fac *LockFactory) Has(key string) bool {
+func (fac *LockFactory) Has(ctx context.Context, key string) bool {
 	fac.mutex.Lock()
 	defer fac.mutex.Unlock()
 
@@ -192,33 +203,36 @@ func (fac *LockFactory) Has(key string) bool {
 
 func TestLocker(t *testing.T) {
 	lockFactory := &LockFactory{locks: map[string]bool{}, mutex: &sync.Mutex{}}
+	ctx := context.Background()
 
 	fc := New(Config{TempDir: "tmp"}, lockFactory)
-	defer fc.Empty()
+	defer fc.Empty(ctx)
 
-	if _, err := fc.lockFactory.Lock("key1"); err != nil {
+	if _, err := fc.lockFactory.Lock(ctx, "key1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fc.lockFactory.Lock("key1"); err == nil {
+	if _, err := fc.lockFactory.Lock(ctx, "key1"); err == nil {
 		t.Fatal("must be locked")
 	}
 }
 
 func TestCleanCachedFileByTTL(t *testing.T) {
-	fc := New(Config{TempDir: "tmp", MaxTTL: 1 * time.Second}, nil)
-	defer fc.Empty()
+	ctx := context.Background()
 
-	if err := fc.Write("key1", sampleReader("ABC1")); err != nil {
+	fc := New(Config{TempDir: "tmp", MaxTTL: 1 * time.Second}, nil)
+	defer fc.Empty(ctx)
+
+	if err := fc.Write(ctx, "key1", sampleReader("ABC1")); err != nil {
 		t.Fatal(err)
 	}
-	if err := fc.Write("key2", sampleReader("ABC2")); err != nil {
+	if err := fc.Write(ctx, "key2", sampleReader("ABC2")); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(time.Second)
-	if err := fc.Write("key3", sampleReader("ABC3")); err != nil {
+	if err := fc.Write(ctx, "key3", sampleReader("ABC3")); err != nil {
 		t.Fatal(err)
 	}
-	if err := fc.cleanCachedFileByTTL(); err != nil {
+	if err := fc.cleanCachedFileByTTL(ctx); err != nil {
 		t.Fatal(err)
 	} else {
 		files, err := fc.Files()
@@ -235,25 +249,26 @@ func TestCleanCachedFileByTTL(t *testing.T) {
 }
 
 func TestCleanCachedFileByLRU(t *testing.T) {
+	ctx := context.Background()
 	data := "bytesample"
 	size := len(data)
-	t.Log(size)
-	fc := New(Config{TempDir: "tmp", MaxSize: int64(size)*2 - 1}, nil)
-	defer fc.Empty()
 
-	if err := fc.Write("key1", sampleReader(data)); err != nil {
+	fc := New(Config{TempDir: "tmp", MaxSize: int64(size)*2 - 1}, nil)
+	defer fc.Empty(ctx)
+
+	if err := fc.Write(ctx, "key1", sampleReader(data)); err != nil {
 		t.Fatal(err)
 	}
-	if err := fc.Write("key2", sampleReader(data)); err != nil {
+	if err := fc.Write(ctx, "key2", sampleReader(data)); err != nil {
 		t.Fatal(err)
 	}
-	if err := fc.Write("key3", sampleReader(data)); err != nil {
+	if err := fc.Write(ctx, "key3", sampleReader(data)); err != nil {
 		t.Fatal(err)
 	}
 	fc.touch("key1", time.Now().Add(-time.Minute))
 	fc.touch("key3", time.Now().Add(-time.Minute))
 
-	if err := fc.cleanCachedFileByLRU(); err != nil {
+	if err := fc.cleanCachedFileByLRU(ctx); err != nil {
 		t.Fatal(err)
 	} else {
 		files, err := fc.Files()
