@@ -18,6 +18,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"time"
 
@@ -29,6 +30,8 @@ func sampleReader(s string) io.Reader {
 }
 
 func main() {
+	ctx := context.Background()
+
 	fc := filecache.New(filecache.Config{
 		BaseDir:         "filecache",
 		TempDir:         "tmp",
@@ -36,14 +39,14 @@ func main() {
 		MaxSize:         10 * 1024 * 1024,
 		CleanupInterval: 10 * time.Second,
 	}, nil)
-	defer fc.Empty()
+	defer fc.Empty(ctx)
 
 	fc.RunGC()
 	defer fc.StopGC()
 
-	fc.Write("key", sampleReader("ABC"))
-	fc.Read("key")
-	fc.Delete("key")
+	fc.Write(ctx, "key", sampleReader("ABC"))
+	fc.Read(ctx, "key")
+	fc.Delete(ctx, "key")
 }
 
 ```
