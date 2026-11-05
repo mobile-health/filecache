@@ -55,6 +55,11 @@ type FileCache struct {
 	quit        chan struct{}
 	stopGC      sync.Once
 	Logger      *logrus.Logger
+
+	// tempMu guards activeTemps, the temp files of in-flight writes,
+	// so Empty never removes a temp file that a Write is still using.
+	tempMu      sync.Mutex
+	activeTemps map[string]struct{}
 }
 
 func ensureDir(dir string) (string, error) {
@@ -208,10 +213,11 @@ func (f *FileCache) Write(ctx context.Context, key string, r io.Reader) error {
 		return err
 	}
 
-	tmp, err := os.CreateTemp(f.TempDir, tempFilePrefix)
+	tmp, err := f.createTemp()
 	if err != nil {
 		return err
 	}
+	defer f.releaseTemp(tmp.Name())
 	tmpClosed := false
 	defer func() {
 		if !tmpClosed {
@@ -268,10 +274,10 @@ func (f *FileCache) Empty(ctx context.Context) error {
 		defer lock.Unlock(ctx)
 	}
 
-	if err := removeDirContents(f.BaseDir); err != nil {
+	if err := removeCachedFiles(f.BaseDir); err != nil {
 		return err
 	}
-	if err := removeTempFiles(f.TempDir); err != nil {
+	if err := f.removeTempFiles(); err != nil {
 		return err
 	}
 	if _, err := ensureDir(f.BaseDir); err != nil {
@@ -294,7 +300,32 @@ func (fc *FileCache) touch(key string, ts time.Time) error {
 	return os.Chtimes(absFilePath, ts, ts)
 }
 
-func removeDirContents(dir string) error {
+// createTemp creates a temp file for a Write and registers it as in-flight.
+func (f *FileCache) createTemp() (*os.File, error) {
+	f.tempMu.Lock()
+	defer f.tempMu.Unlock()
+
+	tmp, err := os.CreateTemp(f.TempDir, tempFilePrefix)
+	if err != nil {
+		return nil, err
+	}
+	if f.activeTemps == nil {
+		f.activeTemps = make(map[string]struct{})
+	}
+	f.activeTemps[filepath.Base(tmp.Name())] = struct{}{}
+	return tmp, nil
+}
+
+func (f *FileCache) releaseTemp(name string) {
+	f.tempMu.Lock()
+	defer f.tempMu.Unlock()
+	delete(f.activeTemps, filepath.Base(name))
+}
+
+// removeCachedFiles removes cache entries only. Keys cannot contain path
+// separators, so every entry is a top-level non-directory; subdirectories
+// (such as the default TempDir) are left untouched.
+func removeCachedFiles(dir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -303,15 +334,23 @@ func removeDirContents(dir string) error {
 		return err
 	}
 	for _, entry := range entries {
-		if err := os.RemoveAll(filepath.Join(dir, entry.Name())); err != nil {
+		if entry.IsDir() {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
 	}
 	return nil
 }
 
-func removeTempFiles(dir string) error {
-	entries, err := os.ReadDir(dir)
+// removeTempFiles removes leftover cache temp files, skipping those that
+// belong to in-flight writes of this FileCache.
+func (f *FileCache) removeTempFiles() error {
+	f.tempMu.Lock()
+	defer f.tempMu.Unlock()
+
+	entries, err := os.ReadDir(f.TempDir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
@@ -322,7 +361,10 @@ func removeTempFiles(dir string) error {
 		if !strings.HasPrefix(entry.Name(), tempFilePrefix) {
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(dir, entry.Name())); err != nil {
+		if _, active := f.activeTemps[entry.Name()]; active {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(f.TempDir, entry.Name())); err != nil {
 			return err
 		}
 	}
@@ -371,64 +413,89 @@ func (fc *FileCache) cleanCachedFileByTTL(ctx context.Context) error {
 		return err
 	}
 
+	log := fc.Logger.WithField("strategy", "TTL")
+	var firstErr error
 	count := 0
 	for _, file := range files {
-		ttl := time.Since(file.ModTime())
-		if ttl > fc.MaxTTL {
-			if err := fc.Delete(ctx, file.Name()); err != nil {
-				return err
-			}
-			count++
-			fc.Logger.WithField("strategy", "TTL").Debugf("Cleaned cache file %s", file.Name())
+		if err := ctx.Err(); err != nil {
+			return err
 		}
+		if time.Since(file.ModTime()) <= fc.MaxTTL {
+			continue
+		}
+		if err := fc.gcDelete(ctx, file.Name()); err != nil {
+			log.WithError(err).Warnf("Failed to clean cache file %s", file.Name())
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		count++
+		log.Debugf("Cleaned cache file %s", file.Name())
 	}
-	fc.Logger.WithField("strategy", "TTL").Infof("Cleaned %v files", count)
+	log.Infof("Cleaned %v files", count)
+	return firstErr
+}
+
+// gcDelete deletes a cache entry on behalf of GC. An entry that is already
+// gone (deleted concurrently) counts as successfully cleaned.
+func (fc *FileCache) gcDelete(ctx context.Context, key string) error {
+	if err := fc.Delete(ctx, key); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
 	return nil
 }
 
+// Size returns the total size of cached entries. Temp files of in-flight
+// writes are not counted, matching the entries GC is able to evict.
 func (fc *FileCache) Size() (int64, error) {
-	var size int64
-	err := filepath.Walk(fc.BaseDir, func(_ string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if !info.IsDir() {
-			size += info.Size()
-		}
-		return err
-	})
-	return size, err
+	files, err := fc.Files()
+	if err != nil {
+		return 0, err
+	}
+	return totalSize(files), nil
+}
 
+func totalSize(files []fs.FileInfo) int64 {
+	var size int64
+	for _, file := range files {
+		size += file.Size()
+	}
+	return size
 }
 
 func (fc *FileCache) cleanCachedFileByLRU(ctx context.Context) error {
-	curSize, err := fc.Size()
+	files, err := fc.Files()
 	if err != nil {
 		return err
 	}
-	resize := curSize - fc.MaxSize
-	if resize > 0 {
-		files, err := fc.Files()
-		if err != nil {
+	resize := totalSize(files) - fc.MaxSize
+	if resize <= 0 {
+		return nil
+	}
+
+	log := fc.Logger.WithField("strategy", "LRU")
+	var firstErr error
+	cleanedSize := int64(0)
+	for _, file := range files {
+		if cleanedSize >= resize {
+			break
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
-
-		cleanedSize := int64(0)
-		for _, file := range files {
-			if err := fc.Delete(ctx, file.Name()); err != nil {
-				return err
-			} else {
-				fc.Logger.WithField("strategy", "LRU").Debugf("Cleaned cached file %s", file.Name())
-
-				cleanedSize += file.Size()
-				if cleanedSize >= resize {
-					break
-				}
+		if err := fc.gcDelete(ctx, file.Name()); err != nil {
+			log.WithError(err).Warnf("Failed to clean cache file %s", file.Name())
+			if firstErr == nil {
+				firstErr = err
 			}
+			continue
 		}
-		fc.Logger.WithField("strategy", "LRU").Infof("Cleaned %v(MB) cached files", byte2MB(cleanedSize))
+		log.Debugf("Cleaned cached file %s", file.Name())
+		cleanedSize += file.Size()
 	}
-	return nil
+	log.Infof("Cleaned %v(MB) cached files", byte2MB(cleanedSize))
+	return firstErr
 }
 
 func (fc *FileCache) cleanCachedFiles(ctx context.Context) error {
@@ -442,14 +509,14 @@ func (fc *FileCache) cleanCachedFiles(ctx context.Context) error {
 		defer lock.Unlock(ctx)
 	}
 
-	if err := fc.cleanCachedFileByTTL(ctx); err != nil {
-		return err
+	// Run LRU even if TTL failed on some entries, so one bad key cannot
+	// stop the cache from being kept under MaxSize.
+	ttlErr := fc.cleanCachedFileByTTL(ctx)
+	lruErr := fc.cleanCachedFileByLRU(ctx)
+	if ttlErr != nil {
+		return ttlErr
 	}
-
-	if err := fc.cleanCachedFileByLRU(ctx); err != nil {
-		return err
-	}
-	return nil
+	return lruErr
 }
 
 // RunGC runs GC to clean old files

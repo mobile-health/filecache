@@ -579,3 +579,202 @@ func TestRunGCCleansExpiredFiles(t *testing.T) {
 		}
 	}
 }
+
+func TestEmptyDoesNotBreakInFlightWrite(t *testing.T) {
+	ctx := context.Background()
+	// Default TempDir lives inside BaseDir.
+	fc := New(Config{BaseDir: filepath.Join(t.TempDir(), "cache")}, nil)
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	errs := make(chan error, 1)
+	go func() {
+		errs <- fc.Write(ctx, "key", &blockingReader{
+			reader:  sampleReader("ABC"),
+			started: started,
+			release: release,
+		})
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for write to start")
+	}
+	if err := fc.Empty(ctx); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+
+	if err := <-errs; err != nil {
+		t.Fatalf("in-flight Write failed after Empty: %v", err)
+	}
+	r, err := fc.Read(ctx, "key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatal(err)
+	}
+	if buf.String() != "ABC" {
+		t.Fatalf("stored value = %q, want ABC", buf.String())
+	}
+}
+
+func TestEmptyKeepsSubdirectories(t *testing.T) {
+	ctx := context.Background()
+	fc := newTestFileCache(t, Config{}, nil)
+
+	subFile := filepath.Join(fc.BaseDir, "sub", "keep.txt")
+	if err := os.MkdirAll(filepath.Dir(subFile), defaultDirFileMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(subFile, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := fc.Write(ctx, "key", sampleReader("ABC")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := fc.Empty(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if fc.Has("key") {
+		t.Fatal("empty must remove cached files")
+	}
+	if _, err := os.Stat(subFile); err != nil {
+		t.Fatalf("empty removed a non-cache subdirectory: %v", err)
+	}
+}
+
+func TestSizeIgnoresTempFiles(t *testing.T) {
+	ctx := context.Background()
+	data := "bytesample"
+	fc := New(Config{
+		BaseDir: filepath.Join(t.TempDir(), "cache"),
+		MaxSize: int64(len(data)),
+	}, nil)
+
+	if err := fc.Write(ctx, "key", sampleReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	leftover := filepath.Join(fc.TempDir, tempFilePrefix+"inflight")
+	if err := os.WriteFile(leftover, bytes.Repeat([]byte("x"), 1000), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	size, err := fc.Size()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != int64(len(data)) {
+		t.Fatalf("Size() = %d, want %d (temp files must not count)", size, len(data))
+	}
+	if err := fc.cleanCachedFileByLRU(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !fc.Has("key") {
+		t.Fatal("LRU evicted a cache entry because of temp file size")
+	}
+}
+
+// hookLockFactory lets a test fail or intercept Lock for specific keys.
+type hookLockFactory struct {
+	*LockFactory
+	onLock func(key string) error
+}
+
+func (h *hookLockFactory) Lock(ctx context.Context, key string) (ILock, error) {
+	if h.onLock != nil {
+		if err := h.onLock(key); err != nil {
+			return nil, err
+		}
+	}
+	return h.LockFactory.Lock(ctx, key)
+}
+
+// newHookedCache returns a cache and an arm func. Once armed, locking "bad"
+// fails and the file of "gone" disappears right before it is deleted
+// (simulating a concurrent Delete).
+func newHookedCache(t *testing.T, config Config) (*FileCache, func()) {
+	t.Helper()
+	lf := &hookLockFactory{LockFactory: &LockFactory{locks: map[string]bool{}, mutex: &sync.Mutex{}}}
+	fc := newTestFileCache(t, config, lf)
+	arm := func() { lf.onLock = hookFor(fc) }
+	return fc, arm
+}
+
+func hookFor(fc *FileCache) func(key string) error {
+	return func(key string) error {
+		switch key {
+		case keylock("bad"):
+			return errors.New("lock busy")
+		case keylock("gone"):
+			os.Remove(fc.absFilePath("gone"))
+		}
+		return nil
+	}
+}
+
+func fileNames(t *testing.T, fc *FileCache) []string {
+	t.Helper()
+	files, err := fc.Files()
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(files))
+	for _, f := range files {
+		names = append(names, f.Name())
+	}
+	return names
+}
+
+func TestCleanByTTLContinuesAfterDeleteError(t *testing.T) {
+	ctx := context.Background()
+	fc, arm := newHookedCache(t, Config{MaxTTL: time.Second})
+
+	for _, key := range []string{"bad", "gone", "ok"} {
+		if err := fc.Write(ctx, key, sampleReader("ABC")); err != nil {
+			t.Fatal(err)
+		}
+		if err := fc.touch(key, time.Now().Add(-2*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	arm()
+	if err := fc.cleanCachedFiles(ctx); err == nil {
+		t.Fatal("expected the lock error of key bad to be reported")
+	}
+	if names := fileNames(t, fc); len(names) != 1 || names[0] != "bad" {
+		t.Fatalf("remaining files = %v, want [bad]", names)
+	}
+}
+
+func TestCleanByLRUContinuesAfterDeleteError(t *testing.T) {
+	ctx := context.Background()
+	data := "bytesample"
+	fc, arm := newHookedCache(t, Config{MaxSize: int64(len(data)) * 2})
+
+	now := time.Now()
+	for i, key := range []string{"bad", "gone", "victim", "keep"} {
+		if err := fc.Write(ctx, key, sampleReader(data)); err != nil {
+			t.Fatal(err)
+		}
+		if err := fc.touch(key, now.Add(time.Duration(i-4)*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	arm()
+	if err := fc.cleanCachedFileByLRU(ctx); err == nil {
+		t.Fatal("expected the lock error of key bad to be reported")
+	}
+	// bad: lock fails (skipped), gone: already removed (counts as freed),
+	// victim: deleted, which frees enough space; keep stays.
+	if names := fileNames(t, fc); len(names) != 2 || names[0] != "bad" || names[1] != "keep" {
+		t.Fatalf("remaining files = %v, want [bad keep]", names)
+	}
+}
