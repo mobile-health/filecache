@@ -5,11 +5,14 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 func sampleReader(s string) io.Reader {
@@ -391,17 +394,17 @@ func TestUnsafeKeysRejected(t *testing.T) {
 
 	for _, key := range []string{"", ".", "..", "../escape", "nested/key", `nested\key`, "/absolute"} {
 		t.Run(key, func(t *testing.T) {
-			if err := fc.Write(ctx, key, sampleReader("ABC")); !errors.Is(err, errInvalidKey) {
-				t.Fatalf("Write(%q) error = %v, want %v", key, err, errInvalidKey)
+			if err := fc.Write(ctx, key, sampleReader("ABC")); !errors.Is(err, ErrInvalidKey) {
+				t.Fatalf("Write(%q) error = %v, want %v", key, err, ErrInvalidKey)
 			}
-			if _, err := fc.Read(ctx, key); !errors.Is(err, errInvalidKey) {
-				t.Fatalf("Read(%q) error = %v, want %v", key, err, errInvalidKey)
+			if _, err := fc.Read(ctx, key); !errors.Is(err, ErrInvalidKey) {
+				t.Fatalf("Read(%q) error = %v, want %v", key, err, ErrInvalidKey)
 			}
-			if err := fc.Delete(ctx, key); !errors.Is(err, errInvalidKey) {
-				t.Fatalf("Delete(%q) error = %v, want %v", key, err, errInvalidKey)
+			if err := fc.Delete(ctx, key); !errors.Is(err, ErrInvalidKey) {
+				t.Fatalf("Delete(%q) error = %v, want %v", key, err, ErrInvalidKey)
 			}
-			if err := fc.touch(key, time.Now()); !errors.Is(err, errInvalidKey) {
-				t.Fatalf("touch(%q) error = %v, want %v", key, err, errInvalidKey)
+			if err := fc.touch(key, time.Now()); !errors.Is(err, ErrInvalidKey) {
+				t.Fatalf("touch(%q) error = %v, want %v", key, err, ErrInvalidKey)
 			}
 			if fc.Has(key) {
 				t.Fatalf("Has(%q) = true, want false", key)
@@ -464,7 +467,7 @@ func TestConcurrentWriteDoesNotOverwriteDuplicateKey(t *testing.T) {
 		switch {
 		case err == nil:
 			successes++
-		case errors.Is(err, errKeyExisted):
+		case errors.Is(err, ErrKeyExisted):
 			duplicates++
 		default:
 			t.Fatal(err)
@@ -776,5 +779,46 @@ func TestCleanByLRUContinuesAfterDeleteError(t *testing.T) {
 	// victim: deleted, which frees enough space; keep stays.
 	if names := fileNames(t, fc); len(names) != 2 || names[0] != "bad" || names[1] != "keep" {
 		t.Fatalf("remaining files = %v, want [bad keep]", names)
+	}
+}
+
+func TestReadReturnsErrLockedWhenKeyLocked(t *testing.T) {
+	ctx := context.Background()
+	lockFactory := &LockFactory{locks: map[string]bool{}, mutex: &sync.Mutex{}}
+	fc := newTestFileCache(t, Config{}, lockFactory)
+
+	if err := fc.Write(ctx, "key", sampleReader("ABC")); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := lockFactory.Lock(ctx, keylock("key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fc.Read(ctx, "key"); !errors.Is(err, ErrLocked) {
+		t.Fatalf("Read on locked key error = %v, want %v", err, ErrLocked)
+	}
+	lock.Unlock(ctx)
+
+	r, err := fc.Read(ctx, "key")
+	if err != nil {
+		t.Fatalf("Read after unlock: %v", err)
+	}
+	r.Close()
+}
+
+func TestReadMissingKeyIsNotExist(t *testing.T) {
+	fc := newTestFileCache(t, Config{}, nil)
+
+	if _, err := fc.Read(context.Background(), "missing"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Read(missing) error = %v, want fs.ErrNotExist", err)
+	}
+}
+
+func TestLogLevel(t *testing.T) {
+	if got := newTestFileCache(t, Config{}, nil).Logger.Level; got != logrus.WarnLevel {
+		t.Fatalf("default log level = %v, want %v", got, logrus.WarnLevel)
+	}
+	if got := newTestFileCache(t, Config{LogLevel: logrus.DebugLevel}, nil).Logger.Level; got != logrus.DebugLevel {
+		t.Fatalf("explicit log level = %v, want %v", got, logrus.DebugLevel)
 	}
 }
