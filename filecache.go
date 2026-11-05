@@ -22,13 +22,20 @@ const (
 	defaultBaseDir         = "filecache"
 	defaultCleanupInterval = 5 * time.Minute
 	defaultLockKey         = "lock_filecache"
+	defaultLogLevel        = logrus.WarnLevel
 	defaultDirFileMode     = os.FileMode(0777)
 	tempFilePrefix         = "filecachetmp-"
 )
 
 var (
-	errKeyExisted = errors.New("key existed")
-	errInvalidKey = errors.New("invalid key")
+	// ErrKeyExisted is returned by Write when the key is already cached.
+	ErrKeyExisted = errors.New("key existed")
+	// ErrInvalidKey is returned when a key is empty, ".", ".." or contains
+	// a path separator or NUL byte.
+	ErrInvalidKey = errors.New("invalid key")
+	// ErrLocked is returned by Read when the key is locked by a Write or
+	// Delete in progress. Callers may retry or treat it as a cache miss.
+	ErrLocked = errors.New("has locked")
 )
 
 type Config struct {
@@ -37,7 +44,10 @@ type Config struct {
 	MaxSize         int64
 	MaxTTL          time.Duration
 	CleanupInterval time.Duration
-	LogLevel        logrus.Level
+	// LogLevel defaults to logrus.WarnLevel when left as zero, so GC
+	// failures are reported. Zero is logrus.PanicLevel and cannot be chosen
+	// here; to silence logs set fc.Logger.Out to io.Discard after New.
+	LogLevel logrus.Level
 }
 
 type ILock interface {
@@ -102,6 +112,9 @@ func New(config Config, lockFactory ILockFatory) *FileCache {
 	if fc.CleanupInterval == 0 {
 		fc.CleanupInterval = defaultCleanupInterval
 	}
+	if fc.LogLevel == 0 {
+		fc.LogLevel = defaultLogLevel
+	}
 	fc.Logger = &logrus.Logger{
 		Out:          os.Stderr,
 		Formatter:    new(logrus.TextFormatter),
@@ -130,10 +143,10 @@ func keylock(key string) string {
 
 func validateKey(key string) error {
 	if key == "" || key == "." || key == ".." {
-		return errInvalidKey
+		return ErrInvalidKey
 	}
 	if filepath.IsAbs(key) || strings.ContainsAny(key, `/\`) || strings.ContainsRune(key, 0) {
-		return errInvalidKey
+		return ErrInvalidKey
 	}
 	return nil
 }
@@ -160,14 +173,15 @@ func (f *FileCache) hasFile(key string) (string, error) {
 	return absFilePath, nil
 }
 
-// Read returns an IO stream of file reader
+// Read returns an IO stream of file reader. A missing key returns an error
+// matching fs.ErrNotExist; a locked key returns ErrLocked.
 func (f *FileCache) Read(ctx context.Context, key string) (io.ReadCloser, error) {
 	if err := validateKey(key); err != nil {
 		return nil, err
 	}
 	if f.lockFactory != nil {
 		if f.lockFactory.Has(ctx, keylock(key)) {
-			return nil, errors.New("has locked")
+			return nil, ErrLocked
 		}
 	}
 
@@ -207,7 +221,7 @@ func (f *FileCache) Write(ctx context.Context, key string, r io.Reader) error {
 
 	absFilePath, err := f.hasFile(key)
 	if err == nil {
-		return errKeyExisted
+		return ErrKeyExisted
 	}
 	if !errors.Is(err, fs.ErrNotExist) {
 		return err
@@ -239,7 +253,7 @@ func (f *FileCache) Write(ctx context.Context, key string, r io.Reader) error {
 
 	if err := os.Link(tmp.Name(), absFilePath); err != nil {
 		if errors.Is(err, fs.ErrExist) {
-			return errKeyExisted
+			return ErrKeyExisted
 		}
 		return err
 	}

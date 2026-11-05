@@ -10,6 +10,17 @@
 - Compatible with distributed systems.
 
 
+# Errors
+
+| Error | Returned by | Meaning |
+|---|---|---|
+| `fs.ErrNotExist` | `Read`, `Delete` | Key is not cached |
+| `filecache.ErrKeyExisted` | `Write` | Key is already cached |
+| `filecache.ErrLocked` | `Read` | Key is locked by a `Write` or `Delete` in progress |
+| `filecache.ErrInvalidKey` | all key methods | Key is empty, `.`, `..`, or contains `/`, `\` or NUL |
+
+Check them with `errors.Is`. GC failures are logged at warn level by default (`Config.LogLevel`).
+
 # Usage
 
 
@@ -19,7 +30,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"io/fs"
 	"time"
 
 	"github.com/mobile-health/filecache"
@@ -44,8 +57,22 @@ func main() {
 	fc.RunGC()
 	defer fc.StopGC()
 
-	fc.Write(ctx, "key", sampleReader("ABC"))
-	fc.Read(ctx, "key")
+	if err := fc.Write(ctx, "key", sampleReader("ABC")); err != nil && !errors.Is(err, filecache.ErrKeyExisted) {
+		panic(err)
+	}
+
+	r, err := fc.Read(ctx, "key")
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		// cache miss
+	case errors.Is(err, filecache.ErrLocked):
+		// key is being written or deleted: retry or treat as a miss
+	case err != nil:
+		panic(err)
+	default:
+		defer r.Close()
+	}
+
 	fc.Delete(ctx, "key")
 }
 
